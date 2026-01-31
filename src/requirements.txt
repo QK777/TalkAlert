@@ -1,0 +1,5 @@
+# TalkAlert runtime requirements
+# Recommended Python: 3.11 / 3.12 (Windows)
+discord.py>=2.3
+ttkbootstrap>=1.10
+pygame-ce>=2.4
