@@ -2,6 +2,7 @@
 
 指定ユーザーの発言をBOTで監視して音で通知する Discord アラートツール（Windows）
 
+![TalkAlert](img/TalkAlertgazo.png)
 ---
 
 ## 主な機能
