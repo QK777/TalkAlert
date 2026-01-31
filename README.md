@@ -1,0 +1,2 @@
+# TalkAlert
+指定ユーザーの発言をBOTで監視して音で通知するDiscordアラートツール（Windows）
