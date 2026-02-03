@@ -26,6 +26,8 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -45,6 +47,8 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 ALLOWED_AUDIO = (".wav", ".mp3")
+
+PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
 
 
 def resource_path(rel: str) -> Path:
@@ -119,6 +123,14 @@ class TalkAlertApp(tb.Window):
         self._in_tray = False
         self._tray_icon = None
         self._tray_thread = None
+
+        # pushover (iOS push)
+        self.pushover_enabled: bool = False
+        self.pushover_user_key: str = ""
+        self.pushover_app_token: str = ""
+        self.pushover_sound: str = ""  # optional (Pushover sound name)
+        self.pushover_push_when_muted: bool = True
+        self.pushover_include_message: bool = True  # include message text in push
 
         # discord runtime
         self._discord_client = None
@@ -662,6 +674,67 @@ class TalkAlertApp(tb.Window):
             bootstyle="secondary",
         ).pack(anchor="w", pady=(6, 0))
 
+
+        # ---- Pushover ----
+        tb.Separator(frame).pack(fill=X, pady=(14, 10))
+        tb.Label(frame, text="Pushover (iOS Push)", font=self.font_head).pack(anchor="w")
+        tb.Label(
+            frame,
+            text="iPhoneにPushoverアプリを入れて、User Key と Application Token を設定すると\n対象ユーザー発言時にプッシュ通知が届きます（PCでTalkAlertが起動している間のみ）。",
+            bootstyle="secondary",
+            justify=LEFT,
+            font=self.font_small,
+        ).pack(anchor="w", pady=(6, 10))
+
+        po_enabled_var = tk.BooleanVar(value=self.pushover_enabled)
+        po_when_muted_var = tk.BooleanVar(value=self.pushover_push_when_muted)
+        po_include_msg_var = tk.BooleanVar(value=self.pushover_include_message)
+        po_user_var = tk.StringVar(value=self.pushover_user_key)
+        po_app_var = tk.StringVar(value=self.pushover_app_token)
+        po_sound_var = tk.StringVar(value=self.pushover_sound)
+
+        tb.Checkbutton(frame, text="Push通知を有効にする", variable=po_enabled_var, bootstyle="secondary").pack(anchor="w")
+
+        row = tb.Frame(frame)
+        row.pack(fill=X, pady=(8, 0))
+        tb.Label(row, text="User Key", width=10, font=self.font_small).pack(side=LEFT)
+        tb.Entry(row, textvariable=po_user_var, width=55).pack(side=LEFT, fill=X, expand=YES)
+
+        row2 = tb.Frame(frame)
+        row2.pack(fill=X, pady=(6, 0))
+        tb.Label(row2, text="App Token", width=10, font=self.font_small).pack(side=LEFT)
+        tb.Entry(row2, textvariable=po_app_var, width=55, show="•").pack(side=LEFT, fill=X, expand=YES)
+
+        row3 = tb.Frame(frame)
+        row3.pack(fill=X, pady=(6, 0))
+        tb.Label(row3, text="Sound", width=10, font=self.font_small).pack(side=LEFT)
+        tb.Entry(row3, textvariable=po_sound_var, width=55).pack(side=LEFT, fill=X, expand=YES)
+        tb.Label(frame, text="（任意）Pushoverのサウンド名。空なら端末側のデフォルト。", bootstyle="secondary", font=self.font_small).pack(anchor="w", pady=(4, 0))
+
+        tb.Checkbutton(frame, text="Mute中もPushを送る", variable=po_when_muted_var, bootstyle="secondary").pack(anchor="w", pady=(6, 0))
+        tb.Checkbutton(frame, text="Pushにメッセージ本文も含める", variable=po_include_msg_var, bootstyle="secondary").pack(anchor="w", pady=(2, 0))
+
+        test_row = tb.Frame(frame)
+        test_row.pack(fill=X, pady=(8, 0))
+
+        def do_test_push():
+            u = po_user_var.get().strip()
+            t = po_app_var.get().strip()
+            s = po_sound_var.get().strip()
+            if not (u and t):
+                status.set("PushoverのUser Key / App Token を入力してください。")
+                return
+            status.set("テスト通知を送信中…")
+
+            def worker():
+                ok, err = self._pushover_request_sync(t, u, APP_NAME, "TalkAlert テスト通知です。", sound=s)
+                self._ui_call(lambda: status.set("テスト通知: 送信OK" if ok else f"テスト通知: 送信失敗 ({err})"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        tb.Button(test_row, text="Test Push", command=do_test_push, bootstyle="info", width=10).pack(side=LEFT)
+
+
         status = tk.StringVar(value="")
         tb.Label(frame, textvariable=status, bootstyle="secondary").pack(anchor="w", pady=(8, 0))
 
@@ -671,6 +744,14 @@ class TalkAlertApp(tb.Window):
         def do_save():
             tok = token_var.get().strip()
             self.tray_on_minimize = bool(tray_var.get())
+
+            # Pushover settings
+            self.pushover_enabled = bool(po_enabled_var.get())
+            self.pushover_push_when_muted = bool(po_when_muted_var.get())
+            self.pushover_include_message = bool(po_include_msg_var.get())
+            self.pushover_user_key = po_user_var.get().strip()
+            self.pushover_app_token = po_app_var.get().strip()
+            self.pushover_sound = po_sound_var.get().strip()
 
             # If token field is empty: keep existing token (do not overwrite),
             # but still save other settings.
@@ -702,6 +783,13 @@ class TalkAlertApp(tb.Window):
             if messagebox.askyesno(APP_NAME, "保存済みTOKENを削除しますか？（Botは停止します）"):
                 self.bot_token = ""
                 self.tray_on_minimize = bool(tray_var.get())
+                # Pushover settings (also saved)
+                self.pushover_enabled = bool(po_enabled_var.get())
+                self.pushover_push_when_muted = bool(po_when_muted_var.get())
+                self.pushover_include_message = bool(po_include_msg_var.get())
+                self.pushover_user_key = po_user_var.get().strip()
+                self.pushover_app_token = po_app_var.get().strip()
+                self.pushover_sound = po_sound_var.get().strip()
                 self._save_config()
                 self._stop_bot_async()
                 self._set_bot_state("offline", "Bot: TOKEN未設定（⚙で設定）")
@@ -731,6 +819,12 @@ class TalkAlertApp(tb.Window):
             self.muted = bool(data.get("mute", False))
             self.bot_token = str(data.get("token", "") or "").strip()
             self.tray_on_minimize = bool(data.get("tray_on_minimize", True))
+            self.pushover_enabled = bool(data.get("pushover_enabled", False))
+            self.pushover_user_key = str(data.get("pushover_user_key", "") or "").strip()
+            self.pushover_app_token = str(data.get("pushover_app_token", "") or "").strip()
+            self.pushover_sound = str(data.get("pushover_sound", "") or "").strip()
+            self.pushover_push_when_muted = bool(data.get("pushover_push_when_muted", True))
+            self.pushover_include_message = bool(data.get("pushover_include_message", True))
 
             self.rules = []
             for r in data.get("rules", []):
@@ -755,7 +849,24 @@ class TalkAlertApp(tb.Window):
                 "mute": self.muted,
                 "token": self.bot_token,
                 "tray_on_minimize": self.tray_on_minimize,
-                "rules": [{"name": r.name, "user_id": r.user_id, "sound_path": r.sound_path, "volume": int(getattr(r, "volume", 100))} for r in self.rules],
+
+                # pushover (iOS push)
+                "pushover_enabled": self.pushover_enabled,
+                "pushover_user_key": self.pushover_user_key,
+                "pushover_app_token": self.pushover_app_token,
+                "pushover_sound": self.pushover_sound,
+                "pushover_push_when_muted": self.pushover_push_when_muted,
+                "pushover_include_message": self.pushover_include_message,
+
+                "rules": [
+                    {
+                        "name": r.name,
+                        "user_id": r.user_id,
+                        "sound_path": r.sound_path,
+                        "volume": int(getattr(r, "volume", 100)),
+                    }
+                    for r in self.rules
+                ],
             }
             CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -1075,6 +1186,28 @@ class TalkAlertApp(tb.Window):
                     if r is None:
                         return
                     self._ui_call(lambda: self._play_sound(r.sound_path, int(getattr(r, 'volume', 100)), rule_id=r.user_id))
+                    # Pushover push (optional)
+                    try:
+                        if self.pushover_enabled and self.pushover_app_token and self.pushover_user_key:
+                            if (not self.muted) or self.pushover_push_when_muted:
+                                who = (r.name or getattr(message.author, 'display_name', '') or 'User')
+                                where = "DM"
+                                try:
+                                    if message.guild and message.channel:
+                                        where = f"{message.guild.name} / #{message.channel.name}"
+                                except Exception:
+                                    pass
+                                if self.pushover_include_message:
+                                    text = (getattr(message, 'clean_content', '') or getattr(message, 'content', '') or '').strip()
+                                    if not text:
+                                        text = "(textなし)"
+                                    msg = f"{who} @ {where}: {text}"
+                                else:
+                                    msg = f"{who} @ {where}"
+                                jump = getattr(message, 'jump_url', None)
+                                await self._pushover_send_async(APP_NAME, msg, url=jump)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -1089,6 +1222,86 @@ class TalkAlertApp(tb.Window):
             self.after(0, fn)
         except Exception:
             pass
+
+
+    # ------------------------------------------------------------
+    # Pushover (iOS push)
+    # ------------------------------------------------------------
+    def _pushover_request_sync(
+        self,
+        app_token: str,
+        user_key: str,
+        title: str,
+        message: str,
+        url: Optional[str] = None,
+        url_title: str = "Open in Discord",
+        sound: str = "",
+    ) -> tuple[bool, str]:
+        """Send a Pushover notification (blocking). Returns (ok, error_message)."""
+        app_token = (app_token or "").strip()
+        user_key = (user_key or "").strip()
+        if not (app_token and user_key):
+            return False, "PushoverのApp Token / User Key が未設定です。"
+
+        params = {
+            "token": app_token,
+            "user": user_key,
+            "title": title,
+            "message": message,
+        }
+        if url:
+            params["url"] = url
+            params["url_title"] = url_title
+
+        # Optional sound (Pushover built-in sound name)
+        if sound:
+            params["sound"] = sound
+
+        data = urllib.parse.urlencode(params).encode("utf-8")
+        req = urllib.request.Request(PUSHOVER_API_URL, data=data, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                if getattr(resp, "status", 200) != 200:
+                    return False, f"HTTP {getattr(resp, 'status', '?')}: {body}"
+        except Exception as e:
+            return False, str(e)
+
+        try:
+            j = json.loads(body)
+            if int(j.get("status", 0)) == 1:
+                return True, ""
+            errs = j.get("errors") or j.get("error") or body
+            return False, str(errs)
+        except Exception:
+            # if response isn't json
+            return True, ""
+
+    def _pushover_send_sync(
+        self,
+        title: str,
+        message: str,
+        url: Optional[str] = None,
+        url_title: str = "Open in Discord",
+    ) -> tuple[bool, str]:
+        return self._pushover_request_sync(
+            self.pushover_app_token,
+            self.pushover_user_key,
+            title,
+            message,
+            url=url,
+            url_title=url_title,
+            sound=self.pushover_sound,
+        )
+
+    async def _pushover_send_async(
+        self,
+        title: str,
+        message: str,
+        url: Optional[str] = None,
+        url_title: str = "Open in Discord",
+    ) -> tuple[bool, str]:
+        return await asyncio.to_thread(self._pushover_send_sync, title, message, url, url_title)
 
     # ------------------------------------------------------------
     # Bot status indicator (blink dot only; no layout shift)
