@@ -2,14 +2,14 @@
 
 指定ユーザーの発言をBOTで監視して音で通知する Discord アラートツール（Windows）
 
-![TalkAlert](img/TalkAlertgazo.png)
+![TalkAlert](img/TalkAlertgazo2.png)
 ---
 
 ## 主な機能
 - ユーザーIDごとに 効果音（MP3/WAV） と 音量（0〜100%） を設定
 - 最小化で タスクトレイに常駐
 - Mute で通知音を無効化
-
+- Pushoverと連携してスマーフォンで通知とアラートを送信
 ---
 
 ## 動作環境
@@ -54,9 +54,26 @@
    - Volume：0〜100%
 5. 以後、対象ユーザーが発言すると効果音が鳴ります
 6. Mute を ON にすると音が鳴らなくなります
-
 ---
 
+### Pushoverを使う場合
+Pushoverアプリと連携することでスマートフォンでも任意の着信音を鳴らしたり内容が通知できます。  
+※Pushoverは1カ月の試用後使い続ける場合、$4.99 USDで購入する必要があります。（買い切りタイプ）  
+   1. Pushoverのアカウントを作成し、ログインする。  
+   2. 通知を鳴らす端末にPushoverアプリをインストールしログインする。  
+   3. DashboardのYour Applications（Create an Application/API Token）  
+   4. アプリ名やアイコンを入力して作成。  
+   5. API Token/Keyが表示されるのでTalkAlertの設定にそれらを入れる。  
+    
+任意の音をアップロード  
+   1. Dashboardにある Your Custom Sounds セクションから Upload a Sound を選択。  
+   2. Name（名前）Description（説明）を入力してMP3ファイルをアップロード。  
+   　ここで付けたNameがSoundパラメータに指定する名前になります。  
+     
+ アップロード条件  
+ MP3形式のみ　最大500KB　iOSは30秒を超えると再生されないらしい  
+    
+--- 
 ## Discord側の「通常通知音」について
 このアプリが音を鳴らしても、Discord本体の通知音が鳴る場合があります。  
 不要な場合は Discord 側の通知設定（サーバー/チャンネルのミュート等）で調整してください。
