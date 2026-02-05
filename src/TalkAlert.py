@@ -1,14 +1,4 @@
 """
-TalkAlert (Distribution build - Token via Settings ⚙)
-- White UI, thin/clean fonts
-- Bot auto-runs on launch IF token is set
-- Token is NOT embedded in code; set it via ⚙ Settings dialog (saved to %APPDATA%\TalkAlert\config.json)
-- Rules: Name (memo), UserID, Sound (wav/mp3)  ※Table shows filename only; Sound column is right-aligned
-- Prevent duplicate UserID registration ("既に登録済みです")
-- Bot status indicator: fixed-size dot (green/red) + blinking without layout shift + status text
-- Note about Discord's own notification sound is kept in UI
-- Close -> ensures process exits (no lingering process)
-
 Deps:
   pip install discord.py ttkbootstrap pygame-ce
   (pygame-ce provides 'import pygame' and works on Python 3.14)
@@ -50,6 +40,85 @@ ALLOWED_AUDIO = (".wav", ".mp3")
 
 PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
 
+def bind_edit_context_menu(widget: tk.Widget):
+    """Attach a right-click context menu (Cut/Copy/Paste/Select All) to Entry/Text widgets."""
+    menu = tk.Menu(widget, tearoff=0)
+
+    def _cut():
+        try:
+            widget.event_generate("<<Cut>>")
+        except Exception:
+            pass
+
+    def _copy():
+        try:
+            widget.event_generate("<<Copy>>")
+        except Exception:
+            pass
+
+    def _paste():
+        try:
+            widget.event_generate("<<Paste>>")
+        except Exception:
+            pass
+
+    def _select_all():
+        try:
+            widget.focus_set()
+        except Exception:
+            pass
+        # Entry-like
+        try:
+            widget.selection_range(0, tk.END)  # type: ignore[attr-defined]
+            widget.icursor(tk.END)  # type: ignore[attr-defined]
+            return
+        except Exception:
+            pass
+        # Text-like
+        try:
+            widget.tag_add("sel", "1.0", "end-1c")  # type: ignore[attr-defined]
+            widget.mark_set("insert", "end-1c")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    menu.add_command(label="切り取り", command=_cut)
+    menu.add_command(label="コピー", command=_copy)
+    menu.add_command(label="貼り付け", command=_paste)
+    menu.add_separator()
+    menu.add_command(label="全選択", command=_select_all)
+
+    def _popup(event):
+        try:
+            widget.focus_set()
+        except Exception:
+            pass
+
+        # Enable/disable Cut/Copy based on selection (best-effort)
+        has_sel = False
+        try:
+            if hasattr(widget, "selection_present"):
+                has_sel = bool(widget.selection_present())  # type: ignore[attr-defined]
+        except Exception:
+            has_sel = False
+        state = "normal" if has_sel else "disabled"
+        try:
+            menu.entryconfig("切り取り", state=state)
+            menu.entryconfig("コピー", state=state)
+        except Exception:
+            pass
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+
+    # Windows/Linux right click
+    widget.bind("<Button-3>", _popup, add="+")
+    # macOS Ctrl+Click fallback
+    widget.bind("<Control-Button-1>", _popup, add="+")
 
 def resource_path(rel: str) -> Path:
     """Return absolute path to a resource (works for PyInstaller onefile)."""
@@ -90,6 +159,7 @@ class Rule:
     sound_path: str
     volume: int = 100  # 0-100
 
+    pushover_sound: str = ""  # empty -> device default
     @property
     def sound_filename(self) -> str:
         try:
@@ -128,7 +198,6 @@ class TalkAlertApp(tb.Window):
         self.pushover_enabled: bool = False
         self.pushover_user_key: str = ""
         self.pushover_app_token: str = ""
-        self.pushover_sound: str = ""  # optional (Pushover sound name)
         self.pushover_push_when_muted: bool = True
         self.pushover_include_message: bool = True  # include message text in push
 
@@ -300,17 +369,19 @@ class TalkAlertApp(tb.Window):
         body = tb.Frame(rules_card)
         body.pack(fill=BOTH, expand=YES)
 
-        self.tree = ttk.Treeview(body, columns=("name", "user_id", "sound", "vol"), show="headings", height=8)
+        self.tree = ttk.Treeview(body, columns=("name", "user_id", "sound", "vol", "push"), show="headings", height=8)
+        # Headings (Nameはクリックでソート)
         self.tree.heading("name", text="Name", anchor=tk.W)
         self.tree.heading("user_id", text="UserID", anchor=tk.W)
         self.tree.heading("sound", text="Sound", anchor=tk.W)
         self.tree.heading("vol", text="Vol", anchor=tk.W)
+        self.tree.heading("push", text="Push音", anchor=tk.W)
 
-
-        self.tree.column("name", width=170, anchor=tk.W)
+        self.tree.column("name", width=150, anchor=tk.W)
         self.tree.column("user_id", width=190, anchor=tk.W)
-        self.tree.column("sound", width=190, anchor=tk.W)
-        self.tree.column("vol", width=40, anchor=tk.W)
+        self.tree.column("sound", width=150, anchor=tk.W)
+        self.tree.column("vol", width=30, anchor=tk.W)
+        self.tree.column("push", width=90, anchor=tk.W)
 
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -321,14 +392,30 @@ class TalkAlertApp(tb.Window):
 
         self.tree.bind("<<TreeviewSelect>>", self._load_selected_to_form)
 
+        # クリックで Name ソート（▲▼）
+        self._name_sort_active = False
+        self._name_sort_asc = True
+        self._update_name_heading()
+
+        # ドラッグで並び替え（空行は作らない）
+        self._drag_iid = None
+        self._dragging = False
+        self._drag_win = None
+        self.tree.configure(cursor="hand2")
+        self.tree.bind("<ButtonPress-1>", self._on_tree_press, add="+")
+        self.tree.bind("<B1-Motion>", self._on_tree_motion, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_release, add="+")
+
         # Form
         form = tb.Frame(root, padding=(12, 10))
         form.pack(fill=X, pady=(8, 0))
 
+        # Row 0: labels
         tb.Label(form, text="Name (任意)", bootstyle="secondary").grid(row=0, column=0, sticky=W)
         tb.Label(form, text="UserID", bootstyle="secondary").grid(row=0, column=1, sticky=W)
-        tb.Label(form, text="Sound (.wav/.mp3)", bootstyle="secondary").grid(row=0, column=2, sticky=W)
+        tb.Label(form, text="Sound (wav/mp3)", bootstyle="secondary").grid(row=0, column=2, sticky=W)
 
+        # Row 1: entries + Browse/Test
         self.entry_name = tb.Entry(form)
         self.entry_id = tb.Entry(form)
         self.entry_sound = tb.Entry(form)
@@ -337,18 +424,43 @@ class TalkAlertApp(tb.Window):
         self.entry_id.grid(row=1, column=1, sticky=EW, padx=(0, 10), pady=(4, 0))
         self.entry_sound.grid(row=1, column=2, sticky=EW, padx=(0, 10), pady=(4, 0))
 
-        btn_browse = tb.Button(form, text="Browse", command=self.browse_sound, bootstyle="secondary", width=10)
+        # Right-click edit menu
+        bind_edit_context_menu(self.entry_name)
+        bind_edit_context_menu(self.entry_id)
+        bind_edit_context_menu(self.entry_sound)
+
+        btn_browse = tb.Button(form, text="Browse", command=self.browse_sound, bootstyle="secondary", width=8)
         btn_browse.grid(row=1, column=3, sticky=E, pady=(4, 0))
 
-        # Volume (per sound)
+        btn_test = tb.Button(form, text="▶ Test", command=self.test_form, bootstyle="secondary", width=8)
+        btn_test.grid(row=1, column=4, sticky=E, pady=(4, 0), padx=(8, 0))
+
+        # Row 2/3: Pushover push sound (per rule) + Volume
+        tb.Label(form, text="Push音(Pushover)", bootstyle="secondary").grid(row=2, column=0, sticky=W, pady=(10, 0))
+        tb.Label(form, text="Volume", bootstyle="secondary").grid(row=2, column=2, sticky=W, pady=(10, 0))
+
+        self.var_pushover_sound = tk.StringVar(value="")
+        self.entry_pushover_sound = tb.Entry(form, textvariable=self.var_pushover_sound)
+        self.entry_pushover_sound.grid(row=3, column=0, columnspan=1, sticky=EW, padx=(0, 10), pady=(4, 0))
+
+        bind_edit_context_menu(self.entry_pushover_sound)
+
         self.var_volume = tk.IntVar(value=100)
-        tb.Label(form, text="Volume", bootstyle="secondary").grid(row=2, column=0, sticky=W, pady=(10, 0))
-        self.scale_volume = tb.Scale(form, from_=0, to=100, orient=HORIZONTAL, variable=self.var_volume, command=lambda _v: self._update_volume_label())
-        self.scale_volume.grid(row=2, column=1, columnspan=2, sticky=EW, pady=(10, 0), padx=(0, 10))
+        self.scale_volume = tb.Scale(
+            form,
+            from_=0,
+            to=100,
+            length=300,
+            orient=HORIZONTAL,
+            variable=self.var_volume,
+            command=lambda _v: self._update_volume_label(),
+        )
+        self.scale_volume.grid(row=3, column=2, columnspan=2, sticky=EW, pady=(4, 0), padx=(0, 10))
         self.lbl_volume = tb.Label(form, text="100%", bootstyle="secondary", width=5, anchor=E)
-        self.lbl_volume.grid(row=2, column=3, sticky=E, pady=(10, 0))
+        self.lbl_volume.grid(row=3, column=4, sticky=W, pady=(4, 0))
         self._update_volume_label()
 
+        # Column weights
         form.columnconfigure(0, weight=1)
         form.columnconfigure(1, weight=1)
         form.columnconfigure(2, weight=2)
@@ -360,7 +472,6 @@ class TalkAlertApp(tb.Window):
         tb.Button(actions, text="＋ Add", command=self.add_rule, bootstyle="success", width=12).pack(side=LEFT)
         tb.Button(actions, text="⟳ Update", command=self.update_rule, bootstyle="primary", width=12).pack(side=LEFT, padx=(10, 0))
         tb.Button(actions, text="🗑 Remove", command=self.remove_rule, bootstyle="danger", width=12).pack(side=LEFT, padx=(10, 0))
-        tb.Button(actions, text="▶ Test", command=self.test_selected, bootstyle="secondary", width=12).pack(side=RIGHT)
 
         # Footer note (keep)
 ##note = (
@@ -655,6 +766,8 @@ class TalkAlertApp(tb.Window):
         entry.pack(fill=X)
         entry.focus_set()
 
+        bind_edit_context_menu(entry)
+
         def toggle_show():
             entry.configure(show="" if show_var.get() else "•")
 
@@ -691,25 +804,30 @@ class TalkAlertApp(tb.Window):
         po_include_msg_var = tk.BooleanVar(value=self.pushover_include_message)
         po_user_var = tk.StringVar(value=self.pushover_user_key)
         po_app_var = tk.StringVar(value=self.pushover_app_token)
-        po_sound_var = tk.StringVar(value=self.pushover_sound)
 
         tb.Checkbutton(frame, text="Push通知を有効にする", variable=po_enabled_var, bootstyle="secondary").pack(anchor="w")
 
         row = tb.Frame(frame)
         row.pack(fill=X, pady=(8, 0))
         tb.Label(row, text="User Key", width=10, font=self.font_small).pack(side=LEFT)
-        tb.Entry(row, textvariable=po_user_var, width=55).pack(side=LEFT, fill=X, expand=YES)
+        entry_po_user = tb.Entry(row, textvariable=po_user_var, width=55)
+        entry_po_user.pack(side=LEFT, fill=X, expand=YES)
+        bind_edit_context_menu(entry_po_user)
 
         row2 = tb.Frame(frame)
         row2.pack(fill=X, pady=(6, 0))
         tb.Label(row2, text="App Token", width=10, font=self.font_small).pack(side=LEFT)
-        tb.Entry(row2, textvariable=po_app_var, width=55, show="•").pack(side=LEFT, fill=X, expand=YES)
+        entry_po_app = tb.Entry(row2, textvariable=po_app_var, width=55, show="•")
+        entry_po_app.pack(side=LEFT, fill=X, expand=YES)
+        bind_edit_context_menu(entry_po_app)
 
-        row3 = tb.Frame(frame)
-        row3.pack(fill=X, pady=(6, 0))
-        tb.Label(row3, text="Sound", width=10, font=self.font_small).pack(side=LEFT)
-        tb.Entry(row3, textvariable=po_sound_var, width=55).pack(side=LEFT, fill=X, expand=YES)
-        tb.Label(frame, text="（任意）Pushoverのサウンド名。空なら端末側のデフォルト。", bootstyle="secondary", font=self.font_small).pack(anchor="w", pady=(4, 0))
+        tb.Label(
+            frame,
+            text="通知音はルールごとに指定できます。\nメイン画面の『Pushover用Push音』に Pushover のサウンド名を入力してください（空欄なら端末デフォルト）。",
+            bootstyle="secondary",
+            justify=LEFT,
+            font=self.font_small,
+        ).pack(anchor="w", pady=(6, 0))
 
         tb.Checkbutton(frame, text="Mute中もPushを送る", variable=po_when_muted_var, bootstyle="secondary").pack(anchor="w", pady=(6, 0))
         tb.Checkbutton(frame, text="Pushにメッセージ本文も含める", variable=po_include_msg_var, bootstyle="secondary").pack(anchor="w", pady=(2, 0))
@@ -720,14 +838,13 @@ class TalkAlertApp(tb.Window):
         def do_test_push():
             u = po_user_var.get().strip()
             t = po_app_var.get().strip()
-            s = po_sound_var.get().strip()
             if not (u and t):
                 status.set("PushoverのUser Key / App Token を入力してください。")
                 return
             status.set("テスト通知を送信中…")
 
             def worker():
-                ok, err = self._pushover_request_sync(t, u, APP_NAME, "TalkAlert テスト通知です。", sound=s)
+                ok, err = self._pushover_request_sync(t, u, APP_NAME, "TalkAlert テスト通知です。\n（通知音は端末デフォルト。音を変える場合はメイン画面の『Pushover用Push音』で設定）")
                 self._ui_call(lambda: status.set("テスト通知: 送信OK" if ok else f"テスト通知: 送信失敗 ({err})"))
 
             threading.Thread(target=worker, daemon=True).start()
@@ -751,7 +868,6 @@ class TalkAlertApp(tb.Window):
             self.pushover_include_message = bool(po_include_msg_var.get())
             self.pushover_user_key = po_user_var.get().strip()
             self.pushover_app_token = po_app_var.get().strip()
-            self.pushover_sound = po_sound_var.get().strip()
 
             # If token field is empty: keep existing token (do not overwrite),
             # but still save other settings.
@@ -789,7 +905,6 @@ class TalkAlertApp(tb.Window):
                 self.pushover_include_message = bool(po_include_msg_var.get())
                 self.pushover_user_key = po_user_var.get().strip()
                 self.pushover_app_token = po_app_var.get().strip()
-                self.pushover_sound = po_sound_var.get().strip()
                 self._save_config()
                 self._stop_bot_async()
                 self._set_bot_state("offline", "Bot: TOKEN未設定（⚙で設定）")
@@ -819,10 +934,13 @@ class TalkAlertApp(tb.Window):
             self.muted = bool(data.get("mute", False))
             self.bot_token = str(data.get("token", "") or "").strip()
             self.tray_on_minimize = bool(data.get("tray_on_minimize", True))
+
+            # pushover (iOS push)
             self.pushover_enabled = bool(data.get("pushover_enabled", False))
             self.pushover_user_key = str(data.get("pushover_user_key", "") or "").strip()
             self.pushover_app_token = str(data.get("pushover_app_token", "") or "").strip()
-            self.pushover_sound = str(data.get("pushover_sound", "") or "").strip()
+            # legacy: older versions had a global pushover_sound; migrate to per-rule default when present
+            legacy_po_sound = str(data.get("pushover_sound", "") or "").strip()
             self.pushover_push_when_muted = bool(data.get("pushover_push_when_muted", True))
             self.pushover_include_message = bool(data.get("pushover_include_message", True))
 
@@ -831,12 +949,18 @@ class TalkAlertApp(tb.Window):
                 user_id = str(r.get("user_id", "")).strip()
                 if not user_id:
                     continue
+
+                po_sound = str(r.get("pushover_sound", "") or "").strip()
+                if not po_sound and legacy_po_sound:
+                    po_sound = legacy_po_sound
+
                 self.rules.append(
                     Rule(
                         name=str(r.get("name", "")).strip(),
                         user_id=user_id,
                         sound_path=str(r.get("sound_path", "")).strip(),
                         volume=max(0, min(100, int(r.get("volume", 100) or 100))),
+                        pushover_sound=po_sound,
                     )
                 )
         except Exception:
@@ -854,7 +978,6 @@ class TalkAlertApp(tb.Window):
                 "pushover_enabled": self.pushover_enabled,
                 "pushover_user_key": self.pushover_user_key,
                 "pushover_app_token": self.pushover_app_token,
-                "pushover_sound": self.pushover_sound,
                 "pushover_push_when_muted": self.pushover_push_when_muted,
                 "pushover_include_message": self.pushover_include_message,
 
@@ -864,6 +987,7 @@ class TalkAlertApp(tb.Window):
                         "user_id": r.user_id,
                         "sound_path": r.sound_path,
                         "volume": int(getattr(r, "volume", 100)),
+                        "pushover_sound": str(getattr(r, "pushover_sound", "") or "").strip(),
                     }
                     for r in self.rules
                 ],
@@ -872,14 +996,11 @@ class TalkAlertApp(tb.Window):
         except Exception:
             pass
 
-    # ------------------------------------------------------------
-    # Table helpers
-    # ------------------------------------------------------------
     def _refresh_table(self):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         for r in self.rules:
-            self.tree.insert("", "end", iid=r.user_id, values=(r.name, r.user_id, r.sound_filename, f"{int(getattr(r, 'volume', 100))}%"))
+            self.tree.insert("", "end", iid=r.user_id, values=(r.name, r.user_id, r.sound_filename, f"{int(getattr(r, 'volume', 100))}%", getattr(r, 'pushover_sound', '')))
 
         if self.muted:
             self.btn_mute.configure(text="🔇 Mute: ON", bootstyle="danger")
@@ -887,6 +1008,220 @@ class TalkAlertApp(tb.Window):
             self.btn_mute.configure(text="🔇 Mute: OFF", bootstyle="warning")
 
     
+
+
+    # ------------------------------------------------------------
+    # Sort / Drag & Drop for rules table
+    # ------------------------------------------------------------
+    def _update_name_heading(self):
+        try:
+            base = "Name"
+            if getattr(self, "_name_sort_active", False):
+                base = base + (" ▲" if getattr(self, "_name_sort_asc", True) else " ▼")
+            self.tree.heading("name", text=base, anchor=tk.W, command=self._on_name_heading_click)
+        except Exception:
+            pass
+
+    def _on_name_heading_click(self):
+        # toggle sort order (ascending/descending)
+        try:
+            if not getattr(self, "_name_sort_active", False):
+                self._name_sort_active = True
+                self._name_sort_asc = True
+            else:
+                self._name_sort_asc = not getattr(self, "_name_sort_asc", True)
+
+            asc = getattr(self, "_name_sort_asc", True)
+            self.rules.sort(key=lambda r: (r.name or "").casefold())
+            if not asc:
+                self.rules.reverse()
+
+            self._save_config()
+            self._refresh_table()
+            self._update_name_heading()
+        except Exception:
+            pass
+
+    def _sync_rules_from_tree_order(self):
+        """Treeviewの表示順を self.rules に反映する。"""
+        try:
+            order = list(self.tree.get_children())
+            by_id = {str(r.user_id): r for r in self.rules}
+            new_rules = []
+            for iid in order:
+                if iid in by_id:
+                    new_rules.append(by_id[iid])
+            # 念のため：Treeにいないものがあれば末尾に残す
+            for r in self.rules:
+                if str(r.user_id) not in order:
+                    new_rules.append(r)
+            self.rules = new_rules
+        except Exception:
+            pass
+
+    def _show_drag_hint(self, x_root: int, y_root: int, text_: str):
+        try:
+            if self._drag_win is None:
+                w = tk.Toplevel(self)
+                w.overrideredirect(True)
+                try:
+                    w.attributes("-topmost", True)
+                except Exception:
+                    pass
+                lbl = tk.Label(w, text=text_, padx=8, pady=3, relief="solid", borderwidth=1)
+                lbl.pack()
+                self._drag_win = w
+            self._drag_win.geometry(f"+{x_root + 12}+{y_root + 12}")
+        except Exception:
+            self._drag_win = None
+
+    def _hide_drag_hint(self):
+        try:
+            if self._drag_win is not None:
+                self._drag_win.destroy()
+        except Exception:
+            pass
+        self._drag_win = None
+
+    def _on_tree_press(self, event):
+        # クリックで通常選択できるように、ここでは「ドラッグ候補」をセットするだけ。
+        # ある程度マウスが動いた時だけドラッグ開始にする（閾値あり）。
+        try:
+            if self.tree.identify_region(event.x, event.y) == "heading":
+                return
+
+            iid = self.tree.identify_row(event.y)
+            if not iid:
+                # 空白クリック：候補解除
+                self._drag_candidate_iid = None
+                self._dragging = False
+                return
+
+            # 通常の選択は必ず行う（Remove等が効く）
+            try:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+            except Exception:
+                pass
+
+            self._drag_candidate_iid = iid
+            self._drag_iid = iid
+            self._dragging = False
+            self._drag_started = False
+            self._press_x_root = event.x_root
+            self._press_y_root = event.y_root
+            self._press_x = event.x
+            self._press_y = event.y
+
+            # つかむ感はカーソルで（押下時は手のまま、ドラッグ開始でfleurへ）
+            try:
+                self.tree.configure(cursor="hand2")
+            except Exception:
+                pass
+        except Exception:
+            self._drag_candidate_iid = None
+            self._dragging = False
+            self._drag_started = False
+
+    def _on_tree_motion(self, event):
+        # 押下中に一定距離動いたらドラッグ開始
+        iid = getattr(self, "_drag_candidate_iid", None)
+        if not iid:
+            return
+
+        # まだドラッグ開始していない場合は閾値判定
+        if not getattr(self, "_drag_started", False):
+            try:
+                dx = abs(event.x_root - getattr(self, "_press_x_root", event.x_root))
+                dy = abs(event.y_root - getattr(self, "_press_y_root", event.y_root))
+            except Exception:
+                dx = dy = 0
+            if max(dx, dy) < 6:
+                return
+
+            # ドラッグ開始
+            self._drag_started = True
+            self._dragging = True
+
+            # ソート表示は一旦解除（以降は手動順）
+            self._name_sort_active = False
+            self._update_name_heading()
+
+            # visual "grab" feel
+            try:
+                self.tree.configure(cursor="fleur")
+            except Exception:
+                pass
+
+            try:
+                name = self.tree.set(iid, "name") or (self.tree.item(iid, "values") or [""])[0]
+            except Exception:
+                name = ""
+            self._show_drag_hint(event.x_root, event.y_root, f"↕ {name}")
+
+        if not getattr(self, "_dragging", False):
+            return
+
+        # hint follow
+        try:
+            if self._drag_win:
+                self._show_drag_hint(event.x_root, event.y_root, self._drag_win.winfo_children()[0].cget("text"))
+        except Exception:
+            pass
+
+        # move item in-tree (no placeholder rows)
+        try:
+            target = self.tree.identify_row(event.y)
+            if target and target != iid:
+                idx = self.tree.index(target)
+                self.tree.move(iid, "", idx)
+            elif not target:
+                self.tree.move(iid, "", "end")
+        except Exception:
+            pass
+
+    def _on_tree_release(self, _event):
+        # クリックだけなら何もしない（選択が残る）
+        try:
+            started = getattr(self, "_drag_started", False)
+            dragging = getattr(self, "_dragging", False)
+        except Exception:
+            started = dragging = False
+
+        # 後片付け（候補は常に解除）
+        self._drag_candidate_iid = None
+        self._dragging = False
+        self._drag_started = False
+
+        if not started or not dragging:
+            # 普通クリック：ヒントも出てないはずだが念のため
+            self._hide_drag_hint()
+            try:
+                self.tree.configure(cursor="hand2")
+            except Exception:
+                pass
+            return
+
+        # ドラッグ確定：順番保存（リフレッシュで選択が消えるので、Treeはそのまま）
+        self._hide_drag_hint()
+        try:
+            self.tree.configure(cursor="hand2")
+        except Exception:
+            pass
+
+        try:
+            self._sync_rules_from_tree_order()
+            self._save_config()
+            # ドラッグした行を選択状態のままに
+            if getattr(self, "_drag_iid", None):
+                try:
+                    self.tree.selection_set(self._drag_iid)
+                    self.tree.focus(self._drag_iid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _update_volume_label(self):
         try:
             v = int(self.var_volume.get())
@@ -933,6 +1268,10 @@ class TalkAlertApp(tb.Window):
         self.entry_sound.delete(0, "end")
         self.entry_sound.insert(0, r.sound_path)
         try:
+            self.var_pushover_sound.set(str(getattr(r, "pushover_sound", "") or ""))
+        except Exception:
+            self.var_pushover_sound.set("")
+        try:
             self.var_volume.set(int(getattr(r, "volume", 100)))
         except Exception:
             self.var_volume.set(100)
@@ -957,6 +1296,7 @@ class TalkAlertApp(tb.Window):
         name = self.entry_name.get().strip()
         user_id = str(self.entry_id.get()).strip()
         sound = self.entry_sound.get().strip()
+        push_sound = (self.var_pushover_sound.get() or "").strip()
 
         if not user_id:
             messagebox.showinfo(APP_NAME, "UserID を入力してください。")
@@ -969,12 +1309,16 @@ class TalkAlertApp(tb.Window):
             return
 
         vol = max(0, min(100, int(self.var_volume.get() or 100)))
-        self.rules.append(Rule(name=name, user_id=user_id, sound_path=sound, volume=vol))
+        self.rules.append(Rule(name=name, user_id=user_id, sound_path=sound, volume=vol, pushover_sound=push_sound))
         self._save_config()
         self._refresh_table()
 
         self.entry_id.delete(0, "end")
         self.entry_sound.delete(0, "end")
+        try:
+            self.var_pushover_sound.set("")
+        except Exception:
+            pass
         self.entry_id.focus_set()
 
     def update_rule(self):
@@ -986,6 +1330,7 @@ class TalkAlertApp(tb.Window):
         name = self.entry_name.get().strip()
         user_id = str(self.entry_id.get()).strip()
         sound = self.entry_sound.get().strip()
+        push_sound = (self.var_pushover_sound.get() or "").strip()
 
         if not user_id:
             messagebox.showinfo(APP_NAME, "UserID を入力してください。")
@@ -1005,6 +1350,10 @@ class TalkAlertApp(tb.Window):
         r.name = name
         r.user_id = user_id
         r.sound_path = sound
+        try:
+            r.pushover_sound = push_sound
+        except Exception:
+            pass
         try:
             r.volume = max(0, min(100, int(self.var_volume.get() or 100)))
         except Exception:
@@ -1032,16 +1381,29 @@ class TalkAlertApp(tb.Window):
 
         self.entry_id.delete(0, "end")
         self.entry_sound.delete(0, "end")
+        try:
+            self.var_pushover_sound.set("")
+        except Exception:
+            pass
 
+    def test_form(self):
+        """現在フォームに入力されている内容を再生してテストする（Update前でもOK）。"""
+        sound = self.entry_sound.get().strip()
+        if not sound or not sound.lower().endswith(ALLOWED_AUDIO):
+            messagebox.showinfo(APP_NAME, "Sound は .wav または .mp3 を指定してください。")
+            return
+        try:
+            vol = max(0, min(100, int(self.var_volume.get() or 100)))
+        except Exception:
+            vol = 100
+
+        # selectionがあればそのルールID、なければテスト用IDで再生
+        rid = self._get_selected_user_id() or "__test__"
+        self._play_sound(sound, vol, rule_id=rid)
+
+    # 互換：古いUIから呼ばれても動くように残す
     def test_selected(self):
-        selected = self._get_selected_user_id()
-        if not selected:
-            messagebox.showinfo(APP_NAME, "テストする行を選択してください。")
-            return
-        r = self._find_rule(selected)
-        if not r:
-            return
-        self._play_sound(r.sound_path, int(self.var_volume.get() or 100), rule_id=r.user_id)
+        return self.test_form()
 
     def toggle_mute(self):
         self.muted = not self.muted
@@ -1205,7 +1567,7 @@ class TalkAlertApp(tb.Window):
                                 else:
                                     msg = f"{who} @ {where}"
                                 jump = getattr(message, 'jump_url', None)
-                                await self._pushover_send_async(APP_NAME, msg, url=jump)
+                                await self._pushover_send_async(APP_NAME, msg, url=jump, sound=getattr(r, 'pushover_sound', ''))
                     except Exception:
                         pass
                 except Exception:
@@ -1283,6 +1645,7 @@ class TalkAlertApp(tb.Window):
         message: str,
         url: Optional[str] = None,
         url_title: str = "Open in Discord",
+        sound: str = "",
     ) -> tuple[bool, str]:
         return self._pushover_request_sync(
             self.pushover_app_token,
@@ -1291,7 +1654,7 @@ class TalkAlertApp(tb.Window):
             message,
             url=url,
             url_title=url_title,
-            sound=self.pushover_sound,
+            sound=sound,
         )
 
     async def _pushover_send_async(
@@ -1300,10 +1663,12 @@ class TalkAlertApp(tb.Window):
         message: str,
         url: Optional[str] = None,
         url_title: str = "Open in Discord",
+        sound: str = "",
     ) -> tuple[bool, str]:
-        return await asyncio.to_thread(self._pushover_send_sync, title, message, url, url_title)
+        return await asyncio.to_thread(self._pushover_send_sync, title, message, url, url_title, sound)
 
-    # ------------------------------------------------------------
+
+# ------------------------------------------------------------
     # Bot status indicator (blink dot only; no layout shift)
     # ------------------------------------------------------------
     def _set_dot_color(self, color: str):
